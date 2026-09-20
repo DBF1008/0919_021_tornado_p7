@@ -24,7 +24,16 @@ import unittest
 import warnings
 
 from tornado.escape import utf8
-from tornado.log import LogFormatter, define_logging_options, enable_pretty_logging
+from tornado.log import (
+    LogFormatter,
+    RequestIdFilter,
+    access_log,
+    app_log,
+    define_logging_options,
+    enable_pretty_logging,
+    gen_log,
+    request_id_context,
+)
 from tornado.options import OptionParser
 from tornado.util import basestring_type
 
@@ -115,6 +124,46 @@ class LogFormatterTest(unittest.TestCase):
     def test_unicode_logging(self):
         self.logger.error("\u00e9")
         self.assertEqual(self.get_output(), utf8("\u00e9"))
+
+
+class RequestIdFilterTest(unittest.TestCase):
+    def make_record(self):
+        return logging.LogRecord(
+            "tornado.application", logging.INFO, __file__, 10, "message", (), None
+        )
+
+    def test_filter_injects_request_id(self):
+        record = self.make_record()
+        token = request_id_context.set("123-456-abcdef01")
+        try:
+            RequestIdFilter().filter(record)
+        finally:
+            request_id_context.reset(token)
+        self.assertEqual(record.request_id, "123-456-abcdef01")
+
+    def test_filter_defaults_to_dash(self):
+        record = self.make_record()
+        RequestIdFilter().filter(record)
+        self.assertEqual(record.request_id, "-")
+
+    def test_filter_attached_to_tornado_loggers(self):
+        for logger in (access_log, app_log, gen_log):
+            self.assertTrue(
+                any(isinstance(f, RequestIdFilter) for f in logger.filters),
+                "%s has no RequestIdFilter" % logger.name,
+            )
+
+    def test_log_record_carries_request_id(self):
+        # Records emitted on the tornado loggers while a request_id is
+        # set in the context automatically carry the request_id.
+        record = self.make_record()
+        token = request_id_context.set("123-456-abcdef01")
+        try:
+            for f in app_log.filters:
+                f.filter(record)
+        finally:
+            request_id_context.reset(token)
+        self.assertEqual(record.request_id, "123-456-abcdef01")
 
 
 class EnablePrettyLoggingTest(unittest.TestCase):

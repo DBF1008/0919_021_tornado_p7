@@ -1,7 +1,9 @@
 import copy
 import datetime
 import logging
+import os
 import pickle
+import re
 import time
 import unittest
 import urllib.parse
@@ -13,6 +15,7 @@ from tornado.httputil import (
     HTTPInputError,
     HTTPServerRequest,
     ParseMultipartConfig,
+    _generate_request_id,
     format_timestamp,
     parse_cookie,
     parse_multipart_form_data,
@@ -603,6 +606,53 @@ class HTTPServerRequestTest(unittest.TestCase):
             method="GET", uri="/", headers=HTTPHeaders({"Canary": ["Coal Mine"]})
         )
         self.assertNotIn("Canary", repr(request))
+
+
+class RequestIdTest(unittest.TestCase):
+    def test_generate_request_id_format(self):
+        request_id = _generate_request_id()
+        timestamp, pid, random_part = request_id.split("-")
+        self.assertTrue(timestamp.isdigit())
+        self.assertEqual(pid, str(os.getpid()))
+        self.assertIsNotNone(re.fullmatch(r"[0-9a-f]{8}", random_part))
+
+    def test_generate_request_id_unique(self):
+        self.assertNotEqual(_generate_request_id(), _generate_request_id())
+
+    def test_request_id_defaults_to_none(self):
+        request = HTTPServerRequest(method="GET", uri="/")
+        self.assertIsNone(request.request_id)
+
+    def test_explicit_request_id(self):
+        request = HTTPServerRequest(
+            method="GET", uri="/", request_id="123-456-abcdef01"
+        )
+        self.assertEqual(request.request_id, "123-456-abcdef01")
+
+    def test_request_id_picked_up_from_connection(self):
+        class Connection:
+            request_id = "123-456-abcdef01"
+
+        request = HTTPServerRequest(
+            method="GET",
+            uri="/",
+            headers=HTTPHeaders({"Host": "example.com"}),
+            connection=Connection(),  # type: ignore
+        )
+        self.assertEqual(request.request_id, "123-456-abcdef01")
+
+    def test_explicit_request_id_wins_over_connection(self):
+        class Connection:
+            request_id = "from-connection"
+
+        request = HTTPServerRequest(
+            method="GET",
+            uri="/",
+            headers=HTTPHeaders({"Host": "example.com"}),
+            connection=Connection(),  # type: ignore
+            request_id="explicit",
+        )
+        self.assertEqual(request.request_id, "explicit")
 
 
 class ParseRequestStartLineTest(unittest.TestCase):

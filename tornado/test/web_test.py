@@ -26,7 +26,13 @@ from tornado.escape import (
     utf8,
 )
 from tornado.httpclient import HTTPClientError
-from tornado.httputil import format_timestamp
+from tornado.httputil import (
+    HTTPHeaders,
+    HTTPMessageDelegate,
+    HTTPServerRequest,
+    format_timestamp,
+)
+from tornado.routing import PathMatches, Rule
 from tornado.iostream import IOStream
 from tornado.locks import Event
 from tornado.log import app_log, gen_log
@@ -3340,6 +3346,119 @@ class ApplicationTest(AsyncTestCase):
         app = Application([])
         server = app.listen(0, address="127.0.0.1")
         server.stop()
+
+
+class RequestMiddlewareTest(unittest.TestCase):
+    def setUp(self):
+        self.calls = []
+
+    def make_middleware(self, tag, delegate=None):
+        def middleware(request):
+            self.calls.append((tag, request.path))
+            return delegate
+
+        return middleware
+
+    def make_request(self, path="/"):
+        return HTTPServerRequest(
+            method="GET",
+            uri=path,
+            headers=HTTPHeaders({"Host": "example.com"}),
+            connection=object(),  # type: ignore
+        )
+
+    def test_middleware_short_circuits_routing(self):
+        class Delegate(HTTPMessageDelegate):
+            pass
+
+        app = Application(
+            [(r"/", RequestHandler)],
+            request_middleware=[self.make_middleware("mw", Delegate())],
+        )
+        delegate = app.find_handler(self.make_request("/"))
+        self.assertIsInstance(delegate, Delegate)
+
+    def test_middleware_runs_in_order_until_short_circuit(self):
+        class Delegate(HTTPMessageDelegate):
+            pass
+
+        app = Application(
+            [(r"/", RequestHandler)],
+            request_middleware=[
+                self.make_middleware("mw1"),
+                self.make_middleware("mw2", Delegate()),
+                self.make_middleware("mw3"),
+            ],
+        )
+        app.find_handler(self.make_request("/"))
+        self.assertEqual(self.calls, [("mw1", "/"), ("mw2", "/")])
+
+    def test_middleware_passthrough_uses_router(self):
+        app = Application(
+            [(r"/", RequestHandler)],
+            request_middleware=[self.make_middleware("mw")],
+        )
+        delegate = app.find_handler(self.make_request("/"))
+        self.assertEqual(self.calls, [("mw", "/")])
+        # Routing proceeded normally to the RequestHandler delegate.
+        self.assertEqual(delegate.handler_class, RequestHandler)
+
+    def test_middleware_runs_for_unmatched_routes(self):
+        class Delegate(HTTPMessageDelegate):
+            pass
+
+        app = Application(
+            [(r"/", RequestHandler)],
+            request_middleware=[self.make_middleware("mw", Delegate())],
+        )
+        delegate = app.find_handler(self.make_request("/no-such-route"))
+        self.assertIsInstance(delegate, Delegate)
+
+    def test_rule_middleware_skips_global_chain(self):
+        app = Application(
+            [Rule(PathMatches("/"), RequestHandler, middleware=[])],
+            request_middleware=[self.make_middleware("global")],
+        )
+        app.find_handler(self.make_request("/"))
+        self.assertEqual(self.calls, [])
+
+    def test_rule_middleware_replaces_global_chain(self):
+        app = Application(
+            [
+                Rule(
+                    PathMatches("/"),
+                    RequestHandler,
+                    middleware=[self.make_middleware("rule")],
+                )
+            ],
+            request_middleware=[self.make_middleware("global")],
+        )
+        app.find_handler(self.make_request("/"))
+        self.assertEqual(self.calls, [("rule", "/")])
+
+
+class RequestIdHeaderTest(unittest.TestCase):
+    class Connection:
+        def set_close_callback(self, callback):
+            pass
+
+    def make_handler(self, request_id):
+        request = HTTPServerRequest(
+            method="GET",
+            uri="/",
+            headers=HTTPHeaders({"Host": "example.com"}),
+            connection=self.Connection(),  # type: ignore
+            request_id=request_id,
+        )
+        return RequestHandler(Application([(r"/", RequestHandler)]), request)
+
+    def test_request_id_reflected_in_response_header(self):
+        handler = self.make_handler("123-456-abcdef01")
+        self.assertEqual(handler._headers["X-Request-ID"], "123-456-abcdef01")
+
+    def test_no_request_id_no_header(self):
+        handler = self.make_handler(None)
+        self.assertNotIn("X-Request-ID", handler._headers)
 
 
 class URLSpecReverseTest(unittest.TestCase):

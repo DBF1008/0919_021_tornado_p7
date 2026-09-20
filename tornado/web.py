@@ -96,6 +96,8 @@ from tornado.routing import (
     Rule,
     URLSpec,
     _RuleList,
+    _RequestMiddleware,
+    _run_request_middleware,
 )
 from tornado.util import ObjectDict, _websocket_mask, unicode_type
 
@@ -323,6 +325,9 @@ class RequestHandler:
                 "Date": httputil.format_timestamp(time.time()),
             }
         )
+        # Echo the request id back to the client (if the request has one).
+        if getattr(self.request, "request_id", None):
+            self._headers["X-Request-ID"] = self.request.request_id
         self.set_default_headers()
         self._write_buffer: list[bytes] = []
         self._status_code = 200
@@ -2136,6 +2141,16 @@ class Application(ReversibleRouter):
             ]),
         ])
 
+    The ``request_middleware`` constructor argument (or a
+    ``request_middleware`` setting) configures a list of request
+    middleware.  Each middleware is a callable that takes an
+    `~.httputil.HTTPServerRequest` and returns either an
+    `~.httputil.HTTPMessageDelegate` or ``None``.  Middleware run in
+    order while routing; the first one to return a non-``None`` delegate
+    short-circuits routing and that delegate is used to handle the
+    request.  Individual routes may skip or replace this global chain
+    via the ``middleware`` argument of `~.routing.Rule`.
+
     In addition to this you can use nested `~.routing.Router` instances,
     `~.httputil.HTTPMessageDelegate` subclasses and callables as routing targets
     (see `~.routing` module docs for more information).
@@ -2195,6 +2210,7 @@ class Application(ReversibleRouter):
         handlers: _RuleList | None = None,
         default_host: str | None = None,
         transforms: list[type["OutputTransform"]] | None = None,
+        request_middleware: list[_RequestMiddleware] | None = None,
         **settings: Any,
     ) -> None:
         if transforms is None:
@@ -2205,6 +2221,11 @@ class Application(ReversibleRouter):
             self.transforms = transforms
         self.default_host = default_host
         self.settings = settings
+        # Request middleware run before (and may short-circuit) routing.
+        # Each middleware is a callable taking an
+        # `~.httputil.HTTPServerRequest` and returning an optional
+        # `~.httputil.HTTPMessageDelegate`.
+        self.request_middleware: list[_RequestMiddleware] = list(request_middleware or [])
         self.ui_modules = {
             "linkify": _linkify,
             "xsrf_form_html": _xsrf_form_html,
@@ -2347,9 +2368,22 @@ class Application(ReversibleRouter):
     def find_handler(
         self, request: httputil.HTTPServerRequest, **kwargs: Any
     ) -> "_HandlerDelegate":
-        route = self.default_router.find_handler(request)
+        # Request middleware is executed in order while routing: the
+        # first middleware returning a non-None delegate short-circuits
+        # routing and that delegate is used to handle the request.
+        # Individual rules may skip or replace this global chain (see
+        # `routing.Rule`).
+        route = self.default_router.find_handler(
+            request, middleware=self.request_middleware
+        )
         if route is not None:
             return cast("_HandlerDelegate", route)
+
+        # No route matched; give the global middleware chain a chance to
+        # handle the request before falling back to the default handler.
+        delegate = _run_request_middleware(self.request_middleware, request)
+        if delegate is not None:
+            return cast("_HandlerDelegate", delegate)
 
         if self.settings.get("default_handler_class"):
             return self.get_handler_delegate(

@@ -176,7 +176,7 @@ For more information on application-level routing see docs for `~.web.Applicatio
 """
 
 import re
-from collections.abc import Awaitable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from functools import partial
 from re import Pattern
 from typing import (
@@ -302,10 +302,41 @@ _RuleList = Sequence[
 ]
 
 
+# A request middleware is a callable that receives the current
+# `~.httputil.HTTPServerRequest` and returns either an
+# `~.httputil.HTTPMessageDelegate` (which short-circuits routing and is
+# used to handle the request) or ``None`` to pass control to the next
+# middleware (and eventually to the router).
+_RequestMiddleware = Callable[
+    [httputil.HTTPServerRequest], httputil.HTTPMessageDelegate | None
+]
+
+
+def _run_request_middleware(
+    middleware: Sequence[_RequestMiddleware] | None,
+    request: httputil.HTTPServerRequest,
+) -> httputil.HTTPMessageDelegate | None:
+    """Runs a request middleware chain in order.
+
+    Returns the first non-``None`` `~.httputil.HTTPMessageDelegate`
+    produced by the chain, or ``None`` if every middleware returned
+    ``None``.
+    """
+    for mw in middleware or []:
+        delegate = mw(request)
+        if delegate is not None:
+            return delegate
+    return None
+
+
 class RuleRouter(Router):
     """Rule-based router implementation."""
 
-    def __init__(self, rules: _RuleList | None = None) -> None:
+    def __init__(
+        self,
+        rules: _RuleList | None = None,
+        middleware: Sequence[_RequestMiddleware] | None = None,
+    ) -> None:
         """Constructs a router from an ordered list of rules::
 
             RuleRouter([
@@ -331,7 +362,14 @@ class RuleRouter(Router):
 
         :arg rules: a list of `Rule` instances or tuples of `Rule`
             constructor arguments.
+        :arg middleware: an optional list of request middleware callables
+            used for rules of this router that do not define their own
+            ``middleware``.  If ``None`` (the default), the middleware
+            chain is inherited from the parent router (or from the
+            `~.web.Application`), so a nested router follows its parent's
+            configuration unless it overrides it here.
         """
+        self.middleware = middleware
         self.rules: list[Rule] = []
         if rules:
             self.add_rules(rules)
@@ -363,9 +401,29 @@ class RuleRouter(Router):
     def find_handler(
         self, request: httputil.HTTPServerRequest, **kwargs: Any
     ) -> httputil.HTTPMessageDelegate | None:
+        # The middleware chain in effect for this router: our own
+        # configuration takes precedence over the chain inherited from
+        # the parent router (or application).
+        middleware = self.middleware
+        if middleware is None:
+            middleware = kwargs.get("middleware")
         for rule in self.rules:
             target_params = rule.matcher.match(request)
             if target_params is not None:
+                # A rule may replace the middleware chain (including
+                # with an empty list to skip middleware entirely).
+                rule_middleware = (
+                    rule.middleware if rule.middleware is not None else middleware
+                )
+                if isinstance(rule.target, Router):
+                    # Defer middleware execution to the nested router so
+                    # that its rules may inherit or override the chain.
+                    target_params["middleware"] = rule_middleware
+                else:
+                    delegate = _run_request_middleware(rule_middleware, request)
+                    if delegate is not None:
+                        return delegate
+
                 if rule.target_kwargs:
                     target_params["target_kwargs"] = rule.target_kwargs
 
@@ -414,9 +472,13 @@ class ReversibleRuleRouter(ReversibleRouter, RuleRouter):
     in a rule's matcher (see `Matcher.reverse`).
     """
 
-    def __init__(self, rules: _RuleList | None = None) -> None:
+    def __init__(
+        self,
+        rules: _RuleList | None = None,
+        middleware: Sequence[_RequestMiddleware] | None = None,
+    ) -> None:
         self.named_rules: dict[str, Any] = {}
-        super().__init__(rules)
+        super().__init__(rules, middleware=middleware)
 
     def process_rule(self, rule: "Rule") -> "Rule":
         rule = super().process_rule(rule)
@@ -452,6 +514,7 @@ class Rule:
         target: Any,
         target_kwargs: dict[str, Any] | None = None,
         name: str | None = None,
+        middleware: Sequence[_RequestMiddleware] | None = None,
     ) -> None:
         """Constructs a Rule instance.
 
@@ -468,6 +531,11 @@ class Rule:
             method.
         :arg str name: the name of the rule that can be used to find it
             in `ReversibleRouter.reverse_url` implementation.
+        :arg middleware: an optional list of request middleware callables
+            for this route, replacing the middleware chain inherited from
+            the router (or `~.web.Application`).  Pass an empty list to
+            skip the inherited middleware chain for this route; the
+            default ``None`` inherits the parent configuration unchanged.
         """
         if isinstance(target, str):
             # import the Module and instantiate the class
@@ -478,6 +546,7 @@ class Rule:
         self.target = target
         self.target_kwargs = target_kwargs if target_kwargs else {}
         self.name = name
+        self.middleware = middleware
 
     def reverse(self, *args: Any) -> str | None:
         return self.matcher.reverse(*args)

@@ -32,7 +32,7 @@ from tornado.concurrent import (
     future_set_result_unless_cancelled,
 )
 from tornado.escape import native_str, utf8
-from tornado.log import app_log, gen_log
+from tornado.log import app_log, gen_log, request_id_context
 from tornado.util import GzipDecompressor
 
 CR_OR_LF_RE = re.compile(b"\r|\n")
@@ -126,6 +126,9 @@ class HTTP1Connection(httputil.HTTPConnection):
         """
         self.is_client = is_client
         self.stream = stream
+        # Unique id of the request currently being handled on this
+        # connection (server mode only); set by HTTP1ServerConnection.
+        self.request_id: str | None = None
         if params is None:
             params = HTTP1ConnectionParameters()
         self.params = params
@@ -826,26 +829,35 @@ class HTTP1ServerConnection:
         try:
             while True:
                 conn = HTTP1Connection(self.stream, False, self.params, self.context)
-                request_delegate = delegate.start_request(self, conn)
+                # Generate a unique id for each request served on this
+                # connection and make it available to the logging framework
+                # (see tornado.log.RequestIdFilter) for the duration of
+                # the request.
+                conn.request_id = httputil._generate_request_id()
+                request_id_token = request_id_context.set(conn.request_id)
                 try:
-                    ret = await conn.read_response(request_delegate)
-                except (
-                    iostream.StreamClosedError,
-                    iostream.UnsatisfiableReadError,
-                    asyncio.CancelledError,
-                ):
-                    return
-                except _QuietException:
-                    # This exception was already logged.
-                    conn.close()
-                    return
-                except Exception:
-                    gen_log.error("Uncaught exception", exc_info=True)
-                    conn.close()
-                    return
-                if not ret:
-                    return
-                await asyncio.sleep(0)
+                    request_delegate = delegate.start_request(self, conn)
+                    try:
+                        ret = await conn.read_response(request_delegate)
+                    except (
+                        iostream.StreamClosedError,
+                        iostream.UnsatisfiableReadError,
+                        asyncio.CancelledError,
+                    ):
+                        return
+                    except _QuietException:
+                        # This exception was already logged.
+                        conn.close()
+                        return
+                    except Exception:
+                        gen_log.error("Uncaught exception", exc_info=True)
+                        conn.close()
+                        return
+                    if not ret:
+                        return
+                    await asyncio.sleep(0)
+                finally:
+                    request_id_context.reset(request_id_token)
         finally:
             delegate.on_close(self)
 

@@ -11,11 +11,13 @@
 # under the License.
 
 import typing
+import unittest
 
 from tornado.httputil import (
     HTTPHeaders,
     HTTPMessageDelegate,
     HTTPServerConnectionDelegate,
+    HTTPServerRequest,
     ResponseStartLine,
 )
 from tornado.routing import (
@@ -274,3 +276,103 @@ class WSGIContainerTestCase(AsyncHTTPTestCase):
     def test_delegate_not_found(self):
         response = self.fetch("/404")
         self.assertEqual(response.code, 404)
+
+
+class RuleMiddlewareTest(unittest.TestCase):
+    def setUp(self):
+        self.calls = []
+
+    def make_middleware(self, tag, delegate=None):
+        def middleware(request):
+            self.calls.append((tag, request.path))
+            return delegate
+
+        return middleware
+
+    def make_request(self, path="/"):
+        return HTTPServerRequest(
+            method="GET",
+            uri=path,
+            headers=HTTPHeaders({"Host": "example.com"}),
+            connection=object(),  # type: ignore
+        )
+
+    def find_handler(self, app, path):
+        return app.find_handler(self.make_request(path))
+
+    def test_rule_middleware_replaces_router_chain(self):
+        router = RuleRouter(
+            [
+                Rule(
+                    PathMatches("/handler"),
+                    RequestHandler,
+                    middleware=[self.make_middleware("rule")],
+                )
+            ],
+            middleware=[self.make_middleware("router")],
+        )
+        router.find_handler(self.make_request("/handler"))
+        self.assertEqual(self.calls, [("rule", "/handler")])
+
+    def test_rule_middleware_empty_list_skips_chain(self):
+        router = RuleRouter(
+            [Rule(PathMatches("/handler"), RequestHandler, middleware=[])],
+            middleware=[self.make_middleware("router")],
+        )
+        router.find_handler(self.make_request("/handler"))
+        self.assertEqual(self.calls, [])
+
+    def test_rule_without_middleware_inherits_router_chain(self):
+        router = RuleRouter(
+            [Rule(PathMatches("/handler"), RequestHandler)],
+            middleware=[self.make_middleware("router")],
+        )
+        router.find_handler(self.make_request("/handler"))
+        self.assertEqual(self.calls, [("router", "/handler")])
+
+    def test_middleware_short_circuits_routing(self):
+        class Delegate(HTTPMessageDelegate):
+            pass
+
+        router = RuleRouter(
+            [Rule(PathMatches("/handler"), RequestHandler)],
+            middleware=[self.make_middleware("router", Delegate())],
+        )
+        delegate = router.find_handler(self.make_request("/handler"))
+        self.assertIsInstance(delegate, Delegate)
+
+    def test_nested_router_inherits_parent_chain(self):
+        nested = RuleRouter([(r"/nested/handler", RequestHandler)])
+        router = RuleRouter(
+            [Rule(PathMatches(r"/nested.*"), nested)],
+            middleware=[self.make_middleware("router")],
+        )
+        router.find_handler(self.make_request("/nested/handler"))
+        self.assertEqual(self.calls, [("router", "/nested/handler")])
+
+    def test_nested_router_overrides_parent_chain(self):
+        nested = RuleRouter(
+            [(r"/nested/handler", RequestHandler)],
+            middleware=[self.make_middleware("nested")],
+        )
+        router = RuleRouter(
+            [Rule(PathMatches(r"/nested.*"), nested)],
+            middleware=[self.make_middleware("router")],
+        )
+        router.find_handler(self.make_request("/nested/handler"))
+        self.assertEqual(self.calls, [("nested", "/nested/handler")])
+
+    def test_rule_middleware_applies_to_nested_subtree(self):
+        nested = RuleRouter([(r"/nested/handler", RequestHandler)])
+        router = RuleRouter(
+            [
+                Rule(
+                    PathMatches(r"/nested.*"),
+                    nested,
+                    middleware=[self.make_middleware("rule")],
+                )
+            ],
+            middleware=[self.make_middleware("router")],
+        )
+        router.find_handler(self.make_request("/nested/handler"))
+        self.assertEqual(self.calls, [("rule", "/nested/handler")])

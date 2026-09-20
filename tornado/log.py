@@ -28,6 +28,7 @@ These streams may be configured independently using the standard library's
 to a separate file for analysis.
 """
 
+import contextvars
 import logging
 import logging.handlers
 import sys
@@ -51,6 +52,36 @@ from typing import Any, cast
 access_log = logging.getLogger("tornado.access")
 app_log = logging.getLogger("tornado.application")
 gen_log = logging.getLogger("tornado.general")
+
+# Context variable holding the ``request_id`` of the request currently
+# being handled (see `httputil.HTTPServerRequest.request_id`).  It is set
+# by `tornado.http1connection.HTTP1ServerConnection` while serving a
+# request and read by `RequestIdFilter` so that every log record emitted
+# while handling the request automatically carries the request id.
+request_id_context: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "tornado_request_id", default=None
+)
+
+
+class RequestIdFilter(logging.Filter):
+    """Logging filter that injects the current ``request_id`` into log records.
+
+    The filter reads `request_id_context` and stores its value in the
+    ``request_id`` attribute of every `~logging.LogRecord`, so log formats
+    may include ``%(request_id)s``.  When no request is being handled the
+    attribute is set to ``"-"``.
+
+    This filter is automatically attached to the ``tornado.access``,
+    ``tornado.application`` and ``tornado.general`` loggers.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = request_id_context.get() or "-"
+        return True
+
+
+for _logger in (access_log, app_log, gen_log):
+    _logger.addFilter(RequestIdFilter())
 
 
 def _stderr_supports_color() -> bool:
