@@ -91,6 +91,7 @@ from tornado.routing import (
     AnyMatches,
     DefaultHostMatches,
     HostMatches,
+    RequestMiddlewareChain,
     ReversibleRouter,
     ReversibleRuleRouter,
     Rule,
@@ -1812,6 +1813,11 @@ class RequestHandler:
         """Executes this request with the given output transforms."""
         self._transforms = transforms
         try:
+            # Echo the request id back to the client (unless the handler
+            # has already set its own value).
+            if self.request.request_id and "X-Request-ID" not in self._headers:
+                self.set_header("X-Request-ID", self.request.request_id)
+
             if self.request.method not in self.SUPPORTED_METHODS:
                 raise HTTPError(405)
 
@@ -2166,6 +2172,19 @@ class Application(ReversibleRouter):
     If there's no match for the current request's host, then ``default_host``
     parameter value is matched against host regular expressions.
 
+    Request middleware may be installed with the ``request_middleware``
+    argument (or the ``request_middleware`` setting). Each middleware is a
+    callable taking an `~.httputil.HTTPServerRequest` and returning either
+    an `~.httputil.HTTPMessageDelegate` or ``None``. Before routing, the
+    middleware chain is executed in order; the first middleware returning a
+    non-``None`` delegate short-circuits the chain and that delegate is used
+    to serve the request instead of the regular routing. Individual routes
+    may replace or skip the global chain with the ``middleware`` argument of
+    `~.routing.Rule`.
+
+    .. versionadded:: 6.6
+       The ``request_middleware`` argument.
+
 
     .. warning::
 
@@ -2195,6 +2214,7 @@ class Application(ReversibleRouter):
         handlers: _RuleList | None = None,
         default_host: str | None = None,
         transforms: list[type["OutputTransform"]] | None = None,
+        request_middleware: RequestMiddlewareChain | None = None,
         **settings: Any,
     ) -> None:
         if transforms is None:
@@ -2203,6 +2223,9 @@ class Application(ReversibleRouter):
                 self.transforms.append(GZipContentEncoding)
         else:
             self.transforms = transforms
+        if request_middleware is None:
+            request_middleware = settings.get("request_middleware", [])
+        self.request_middleware: RequestMiddlewareChain = list(request_middleware)
         self.default_host = default_host
         self.settings = settings
         self.ui_modules = {
@@ -2342,11 +2365,35 @@ class Application(ReversibleRouter):
     def __call__(self, request: httputil.HTTPServerRequest) -> Awaitable[None] | None:
         # Legacy HTTPServer interface
         dispatcher = self.find_handler(request)
-        return dispatcher.execute()
+        if isinstance(dispatcher, _HandlerDelegate):
+            return dispatcher.execute()
+        # The dispatcher was provided by request middleware. The request
+        # has already been fully received, so drive the delegate directly.
+        assert request.method is not None and request.uri is not None
+        dispatcher.headers_received(
+            httputil.RequestStartLine(request.method, request.uri, request.version),
+            request.headers,
+        )
+        if request.body:
+            dispatcher.data_received(request.body)
+        dispatcher.finish()
+        return None
 
     def find_handler(
         self, request: httputil.HTTPServerRequest, **kwargs: Any
-    ) -> "_HandlerDelegate":
+    ) -> httputil.HTTPMessageDelegate:
+        # Run the request middleware chain (resolved for the route that
+        # would handle this request) before routing. The first middleware
+        # returning a non-None delegate short-circuits the rest of the
+        # chain and the regular routing.
+        middleware_chain = self.default_router.find_middleware(
+            request, self.request_middleware
+        )
+        for middleware in middleware_chain or []:
+            middleware_delegate = middleware(request)
+            if middleware_delegate is not None:
+                return middleware_delegate
+
         route = self.default_router.find_handler(request)
         if route is not None:
             return cast("_HandlerDelegate", route)

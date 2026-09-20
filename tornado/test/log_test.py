@@ -24,7 +24,16 @@ import unittest
 import warnings
 
 from tornado.escape import utf8
-from tornado.log import LogFormatter, define_logging_options, enable_pretty_logging
+from tornado.log import (
+    LogFormatter,
+    RequestIdLogFilter,
+    access_log,
+    app_log,
+    define_logging_options,
+    enable_pretty_logging,
+    gen_log,
+    request_id_context,
+)
 from tornado.options import OptionParser
 from tornado.util import basestring_type
 
@@ -231,3 +240,55 @@ class LoggingOptionTest(unittest.TestCase):
                 "options.logging = None; parse_command_line()", ["--logging=info"]
             )
         )
+
+
+class RequestIdLogFilterTest(unittest.TestCase):
+    def make_record(self):
+        return logging.LogRecord(
+            "tornado.test", logging.INFO, __file__, 1, "test message", (), None
+        )
+
+    def test_filter_injects_request_id(self):
+        log_filter = RequestIdLogFilter()
+        record = self.make_record()
+        token = request_id_context.set("1695000000000-123-abcdef01")
+        try:
+            self.assertTrue(log_filter.filter(record))
+        finally:
+            request_id_context.reset(token)
+        self.assertEqual(record.request_id, "1695000000000-123-abcdef01")
+
+    def test_filter_placeholder_outside_request(self):
+        log_filter = RequestIdLogFilter()
+        record = self.make_record()
+        self.assertTrue(log_filter.filter(record))
+        self.assertEqual(record.request_id, "-")
+
+    def test_filter_does_not_override_existing_attribute(self):
+        log_filter = RequestIdLogFilter()
+        record = self.make_record()
+        record.request_id = "explicit-id"
+        token = request_id_context.set("other-id")
+        try:
+            log_filter.filter(record)
+        finally:
+            request_id_context.reset(token)
+        self.assertEqual(record.request_id, "explicit-id")
+
+    def test_filter_attached_to_tornado_loggers(self):
+        for logger in (access_log, app_log, gen_log):
+            self.assertTrue(
+                any(isinstance(f, RequestIdLogFilter) for f in logger.filters),
+                "RequestIdLogFilter not attached to %s" % logger.name,
+            )
+
+    def test_log_record_formats_with_request_id(self):
+        log_filter = RequestIdLogFilter()
+        record = self.make_record()
+        token = request_id_context.set("1695000000000-123-abcdef01")
+        try:
+            log_filter.filter(record)
+            formatted = logging.Formatter("%(request_id)s %(message)s").format(record)
+        finally:
+            request_id_context.reset(token)
+        self.assertEqual(formatted, "1695000000000-123-abcdef01 test message")

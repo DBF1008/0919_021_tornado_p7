@@ -604,6 +604,28 @@ class HTTPServerRequestTest(unittest.TestCase):
         )
         self.assertNotIn("Canary", repr(request))
 
+    def test_request_id_generated(self):
+        request = HTTPServerRequest(method="GET", uri="/")
+        self.assertRegex(request.request_id, r"^\d+-\d+-[0-9a-f]{8}$")
+
+    def test_request_id_unique(self):
+        request1 = HTTPServerRequest(method="GET", uri="/")
+        request2 = HTTPServerRequest(method="GET", uri="/")
+        self.assertNotEqual(request1.request_id, request2.request_id)
+
+    def test_request_id_explicit(self):
+        request = HTTPServerRequest(method="GET", uri="/", request_id="custom-id")
+        self.assertEqual(request.request_id, "custom-id")
+
+    def test_request_id_from_connection(self):
+        class FakeConnection:
+            request_id = "conn-request-id"
+
+        request = HTTPServerRequest(
+            method="GET", uri="/", connection=FakeConnection()  # type: ignore[arg-type]
+        )
+        self.assertEqual(request.request_id, "conn-request-id")
+
 
 class ParseRequestStartLineTest(unittest.TestCase):
     METHOD = "GET"

@@ -26,10 +26,16 @@ from tornado.escape import (
     utf8,
 )
 from tornado.httpclient import HTTPClientError
-from tornado.httputil import format_timestamp
+from tornado.httputil import (
+    HTTPHeaders,
+    HTTPMessageDelegate,
+    ResponseStartLine,
+    format_timestamp,
+)
 from tornado.iostream import IOStream
 from tornado.locks import Event
-from tornado.log import app_log, gen_log
+from tornado.log import app_log, gen_log, request_id_context
+from tornado.routing import PathMatches, Rule
 from tornado.simple_httpclient import SimpleAsyncHTTPClient
 from tornado.template import DictLoader
 from tornado.test.util import ignore_deprecation
@@ -3438,3 +3444,121 @@ class AcceptLanguageTest(WebTestCase):
     def test_accept_language_invalid(self):
         response = self.fetch("/", headers={"Accept-Language": "fr-FR;q=-1"})
         self.assertEqual(response.headers["Content-Language"], "en-US")
+
+
+class RequestMiddlewareTest(AsyncHTTPTestCase):
+    def get_app(self):
+        self.middleware_calls = []
+
+        def make_response_delegate(request, body):
+            connection = request.connection
+
+            class MiddlewareDelegate(HTTPMessageDelegate):
+                def finish(self):
+                    connection.write_headers(
+                        ResponseStartLine("HTTP/1.1", 200, "OK"),
+                        HTTPHeaders({"Content-Length": str(len(body))}),
+                        body,
+                    )
+                    connection.finish()
+
+            return MiddlewareDelegate()
+
+        def global_middleware(request):
+            self.middleware_calls.append("global")
+            if request.path == "/short":
+                return make_response_delegate(request, b"short")
+            return None
+
+        def replacement_middleware(request):
+            self.middleware_calls.append("replacement")
+            if request.path == "/replace_short":
+                return make_response_delegate(request, b"replaced")
+            return None
+
+        class HelloHandler(RequestHandler):
+            def get(self):
+                self.write("hello")
+
+        return Application(
+            [
+                ("/hello", HelloHandler),
+                ("/short", HelloHandler),
+                Rule(PathMatches("/skip"), HelloHandler, middleware=[]),
+                Rule(
+                    PathMatches("/replace_short"),
+                    HelloHandler,
+                    middleware=[replacement_middleware],
+                ),
+            ],
+            request_middleware=[global_middleware],
+        )
+
+    def test_global_middleware_passthrough(self):
+        response = self.fetch("/hello")
+        self.assertEqual(response.body, b"hello")
+        self.assertEqual(self.middleware_calls, ["global"])
+
+    def test_global_middleware_short_circuit(self):
+        response = self.fetch("/short")
+        self.assertEqual(response.body, b"short")
+        self.assertEqual(self.middleware_calls, ["global"])
+
+    def test_route_skips_middleware(self):
+        response = self.fetch("/skip")
+        self.assertEqual(response.body, b"hello")
+        self.assertEqual(self.middleware_calls, [])
+
+    def test_route_replaces_middleware(self):
+        response = self.fetch("/replace_short")
+        self.assertEqual(response.body, b"replaced")
+        self.assertEqual(self.middleware_calls, ["replacement"])
+
+
+class RequestMiddlewareOrderTest(AsyncHTTPTestCase):
+    def get_app(self):
+        self.middleware_calls = []
+
+        def make_middleware(name):
+            def middleware(request):
+                self.middleware_calls.append(name)
+                return None
+
+            return middleware
+
+        class HelloHandler(RequestHandler):
+            def get(self):
+                self.write("hello")
+
+        return Application(
+            [("/hello", HelloHandler)],
+            request_middleware=[
+                make_middleware("first"),
+                make_middleware("second"),
+                make_middleware("third"),
+            ],
+        )
+
+    def test_middleware_executes_in_order(self):
+        response = self.fetch("/hello")
+        self.assertEqual(response.body, b"hello")
+        self.assertEqual(self.middleware_calls, ["first", "second", "third"])
+
+
+class RequestIdTest(AsyncHTTPTestCase):
+    def get_app(self):
+        class RequestIdHandler(RequestHandler):
+            def get(self):
+                # The logging context must carry the same id while the
+                # request is being handled.
+                self.write(request_id_context.get() or "none")
+
+        return Application([("/request_id", RequestIdHandler)])
+
+    def test_request_id_response_header(self):
+        response = self.fetch("/request_id")
+        request_id = response.headers["X-Request-ID"]
+        self.assertRegex(request_id, r"^\d+-\d+-[0-9a-f]{8}$")
+        # The id seen by the handler (and thus by the logging context)
+        # matches the id returned to the client.
+        self.assertEqual(response.body.decode("utf8"), request_id)

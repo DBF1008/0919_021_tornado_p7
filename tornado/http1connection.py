@@ -32,7 +32,7 @@ from tornado.concurrent import (
     future_set_result_unless_cancelled,
 )
 from tornado.escape import native_str, utf8
-from tornado.log import app_log, gen_log
+from tornado.log import app_log, gen_log, request_id_context
 from tornado.util import GzipDecompressor
 
 CR_OR_LF_RE = re.compile(b"\r|\n")
@@ -130,6 +130,9 @@ class HTTP1Connection(httputil.HTTPConnection):
             params = HTTP1ConnectionParameters()
         self.params = params
         self.context = context
+        # On server connections, the id of the request currently being
+        # served (assigned by HTTP1ServerConnection); None on clients.
+        self.request_id: str | None = None
         self.no_keep_alive = params.no_keep_alive
         # The body limits can be altered by the delegate, so save them
         # here instead of just referencing self.params later.
@@ -826,6 +829,12 @@ class HTTP1ServerConnection:
         try:
             while True:
                 conn = HTTP1Connection(self.stream, False, self.params, self.context)
+                # Assign an id to the request that is about to be read on
+                # this connection and make it available to the logging
+                # context so that all logs emitted while serving it carry
+                # the request_id.
+                conn.request_id = httputil.generate_request_id()
+                request_id_token = request_id_context.set(conn.request_id)
                 request_delegate = delegate.start_request(self, conn)
                 try:
                     ret = await conn.read_response(request_delegate)
@@ -843,6 +852,8 @@ class HTTP1ServerConnection:
                     gen_log.error("Uncaught exception", exc_info=True)
                     conn.close()
                     return
+                finally:
+                    request_id_context.reset(request_id_token)
                 if not ret:
                     return
                 await asyncio.sleep(0)

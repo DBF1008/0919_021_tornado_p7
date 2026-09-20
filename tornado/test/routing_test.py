@@ -11,11 +11,13 @@
 # under the License.
 
 import typing
+import unittest
 
 from tornado.httputil import (
     HTTPHeaders,
     HTTPMessageDelegate,
     HTTPServerConnectionDelegate,
+    HTTPServerRequest,
     ResponseStartLine,
 )
 from tornado.routing import (
@@ -274,3 +276,65 @@ class WSGIContainerTestCase(AsyncHTTPTestCase):
     def test_delegate_not_found(self):
         response = self.fetch("/404")
         self.assertEqual(response.code, 404)
+
+
+def _noop_middleware(request):
+    return None
+
+
+def _other_middleware(request):
+    return None
+
+
+class FindMiddlewareTest(unittest.TestCase):
+    def make_request(self, path="/"):
+        return HTTPServerRequest(
+            method="GET", uri=path, headers=HTTPHeaders({"Host": "example.com"})
+        )
+
+    def test_rule_without_middleware_inherits(self):
+        router = RuleRouter([Rule(PathMatches("/"), object())])
+        chain = [_noop_middleware]
+        self.assertIs(router.find_middleware(self.make_request(), chain), chain)
+
+    def test_rule_middleware_replaces_inherited(self):
+        router = RuleRouter(
+            [Rule(PathMatches("/"), object(), middleware=[_other_middleware])]
+        )
+        self.assertEqual(
+            router.find_middleware(self.make_request(), [_noop_middleware]),
+            [_other_middleware],
+        )
+
+    def test_rule_empty_middleware_skips(self):
+        router = RuleRouter([Rule(PathMatches("/"), object(), middleware=[])])
+        self.assertEqual(router.find_middleware(self.make_request(), [_noop_middleware]), [])
+
+    def test_no_matching_rule_returns_inherited(self):
+        router = RuleRouter([Rule(PathMatches("/other"), object(), middleware=[])])
+        chain = [_noop_middleware]
+        self.assertIs(router.find_middleware(self.make_request(), chain), chain)
+
+    def test_nested_router_inherits_parent_rule_middleware(self):
+        inner = RuleRouter([Rule(PathMatches("/nested"), object())])
+        outer = RuleRouter(
+            [Rule(PathMatches("/nested"), inner, middleware=[_other_middleware])]
+        )
+        self.assertEqual(
+            outer.find_middleware(self.make_request("/nested"), [_noop_middleware]),
+            [_other_middleware],
+        )
+
+    def test_nested_router_rule_overrides_parent(self):
+        inner = RuleRouter([Rule(PathMatches("/nested"), object(), middleware=[])])
+        outer = RuleRouter(
+            [Rule(PathMatches("/nested"), inner, middleware=[_other_middleware])]
+        )
+        self.assertEqual(
+            outer.find_middleware(self.make_request("/nested"), [_noop_middleware]), []
+        )
+
+    def test_base_router_returns_inherited(self):
+        router = BasicRouter()
+        chain = [_noop_middleware]
+        self.assertIs(router.find_middleware(self.make_request(), chain), chain)

@@ -176,7 +176,7 @@ For more information on application-level routing see docs for `~.web.Applicatio
 """
 
 import re
-from collections.abc import Awaitable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from functools import partial
 from re import Pattern
 from typing import (
@@ -190,6 +190,18 @@ from tornado.escape import url_escape, url_unescape, utf8
 from tornado.httpserver import _CallableAdapter
 from tornado.log import app_log
 from tornado.util import basestring_type, import_object, re_unescape, unicode_type
+
+#: A request middleware is a callable that receives the current
+#: `~.httputil.HTTPServerRequest` and returns either an
+#: `~.httputil.HTTPMessageDelegate` (which short-circuits routing and is used
+#: to serve the request) or ``None`` (to continue with the next middleware or
+#: the regular routing).
+RequestMiddleware = Callable[
+    [httputil.HTTPServerRequest], "httputil.HTTPMessageDelegate | None"
+]
+
+#: An ordered chain of request middleware callables.
+RequestMiddlewareChain = Sequence[RequestMiddleware]
 
 
 class Router(httputil.HTTPServerConnectionDelegate):
@@ -208,6 +220,26 @@ class Router(httputil.HTTPServerConnectionDelegate):
             process the request.
         """
         raise NotImplementedError()
+
+    def find_middleware(
+        self,
+        request: httputil.HTTPServerRequest,
+        inherited: "RequestMiddlewareChain | None" = None,
+    ) -> "RequestMiddlewareChain | None":
+        """Returns the request middleware chain in effect for the given request.
+
+        Routers that support route-level middleware (see `Rule`) override
+        this method to resolve the chain for the route that would handle
+        ``request``. The default implementation simply returns ``inherited``.
+
+        :arg httputil.HTTPServerRequest request: current HTTP request.
+        :arg inherited: the middleware chain inherited from a parent router
+            (or the application-level chain for the root router).
+        :returns: the effective middleware chain, or ``None``.
+
+        .. versionadded:: 6.6
+        """
+        return inherited
 
     def start_request(
         self, server_conn: object, request_conn: httputil.HTTPConnection
@@ -378,6 +410,25 @@ class RuleRouter(Router):
 
         return None
 
+    def find_middleware(
+        self,
+        request: httputil.HTTPServerRequest,
+        inherited: RequestMiddlewareChain | None = None,
+    ) -> RequestMiddlewareChain | None:
+        for rule in self.rules:
+            if rule.matcher.match(request) is not None:
+                # A rule-level ``middleware`` replaces the inherited chain
+                # (use an empty list to skip middleware for this route);
+                # otherwise the inherited chain stays in effect.
+                chain = rule.middleware if rule.middleware is not None else inherited
+                if isinstance(rule.target, Router):
+                    # Nested routers inherit the chain resolved so far, but
+                    # their rules may override it.
+                    return rule.target.find_middleware(request, chain)
+                return chain
+
+        return inherited
+
     def get_target_delegate(
         self, target: Any, request: httputil.HTTPServerRequest, **target_params: Any
     ) -> httputil.HTTPMessageDelegate | None:
@@ -452,6 +503,7 @@ class Rule:
         target: Any,
         target_kwargs: dict[str, Any] | None = None,
         name: str | None = None,
+        middleware: RequestMiddlewareChain | None = None,
     ) -> None:
         """Constructs a Rule instance.
 
@@ -468,6 +520,14 @@ class Rule:
             method.
         :arg str name: the name of the rule that can be used to find it
             in `ReversibleRouter.reverse_url` implementation.
+        :arg middleware: an optional chain of request middleware callables
+            (see `RequestMiddleware`) applied to requests matching this rule.
+            When given, it replaces the middleware chain inherited from the
+            application or a parent router; pass an empty list to skip
+            middleware entirely for this route. ``None`` (the default) means
+            the inherited chain is used unchanged.
+
+            .. versionadded:: 6.6
         """
         if isinstance(target, str):
             # import the Module and instantiate the class
@@ -478,6 +538,7 @@ class Rule:
         self.target = target
         self.target_kwargs = target_kwargs if target_kwargs else {}
         self.name = name
+        self.middleware = middleware
 
     def reverse(self, *args: Any) -> str | None:
         return self.matcher.reverse(*args)
